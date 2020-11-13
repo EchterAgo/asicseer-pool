@@ -1048,7 +1048,12 @@ int wait_read_select(int sockd, float timeout)
     event.events = EPOLLIN | EPOLLRDHUP;
     epoll_ctl(epfd, EPOLL_CTL_ADD, sockd, &event);
     timeout *= 1000;
-    ret = epoll_wait(epfd, &event, 1, timeout);
+    for(;;) {
+        ret = epoll_wait(epfd, &event, 1, timeout);
+        if (unlikely(ret == -1 && errno == EINTR))
+            continue;
+        break;
+    }
     close(epfd);
     return ret;
 }
@@ -1130,7 +1135,12 @@ int wait_write_select(int sockd, float timeout)
     event.events = EPOLLOUT | EPOLLRDHUP ;
     epoll_ctl(epfd, EPOLL_CTL_ADD, sockd, &event);
     timeout *= 1000;
-    ret = epoll_wait(epfd, &event, 1, timeout);
+    for(;;) {
+        ret = epoll_wait(epfd, &event, 1, timeout);
+        if (unlikely(ret == -1 && errno == EINTR))
+            continue;
+        break;
+    }
     close(epfd);
     return ret;
 }

@@ -565,25 +565,54 @@ static void clear_bufline(connsock_t *cs)
     }
 }
 
-static void add_buflen(pool_t *ckp, connsock_t *cs, const char *readbuf, const int len)
+static void ensure_buf_size(connsock_t *cs, const size_t reqalloc, const size_t maxinc_mb)
 {
     int backoff = 1;
-    int buflen;
+    size_t newalloc;
+    void *newmem;
+    const size_t max_realloc_increase = maxinc_mb * 1024 * 1024;
+	static const size_t initial_alloc = 16 * 1024;
+    
+	while (reqalloc > cs->bufsize) {
+		if (cs->bufsize > 0) {
+			newalloc = cs->bufsize * 2;
+		} else {
+            newalloc = initial_alloc;
+		}
 
-    buflen = round_up_page(cs->bufofs + len + 1);
-    while (cs->bufsize < buflen) {
-        char *newbuf = realloc(cs->buf, buflen);
+		if (max_realloc_increase > 0) {
+			/* limit the maximum buffer increase */
+			if (newalloc - cs->bufsize > max_realloc_increase)
+				newalloc = cs->bufsize + max_realloc_increase;
+		}
 
-        if (likely(newbuf)) {
-            cs->bufsize = buflen;
-            cs->buf = newbuf;
-            break;
+		/* ensure we have a big enough allocation */
+		if (reqalloc > newalloc)
+			newalloc = reqalloc;
+
+        newalloc = round_up_page(newalloc);
+
+		newmem = realloc(cs->buf, newalloc);
+		if (unlikely(!newmem)) {
+            if (backoff == 1)
+                fprintf(stderr, "Failed to realloc %d in read_socket_line, retrying\n", (int)newalloc);
+            cksleep_ms(backoff);
+            backoff <<= 1;
+            continue;
         }
-        if (backoff == 1)
-            fprintf(stderr, "Failed to realloc %d in read_socket_line, retrying\n", (int)buflen);
-        cksleep_ms(backoff);
-        backoff <<= 1;
-    }
+
+		cs->buf = newmem;
+		cs->bufsize = newalloc;
+        break;
+	}
+}
+
+static void add_buflen(pool_t *ckp, connsock_t *cs, const char *readbuf, const int len)
+{
+    int buflen = cs->bufofs + len + 1;
+
+    ensure_buf_size(cs, buflen, 8);
+
     /* Increase receive buffer if possible to larger than the largest
      * message we're likely to buffer */
     if (unlikely(!ckp->rmem_warn && buflen > cs->rcvbufsiz))
@@ -636,10 +665,10 @@ int read_socket_contentlen(connsock_t *cs, int contentlen, float *timeout)
     quiet = ckp->proxy | ckp->remote;
 
     clear_bufline(cs);
+    ensure_buf_size(cs, contentlen, 0);
     nread = cs->bufofs;
     tv_time(&start);
 
-    //LOGDEBUG("nread: %d contentlen: %d", nread, contentlen);
     while (nread < contentlen) {
         if (unlikely(cs->fd < 0)) {
             ret = -1;
@@ -662,7 +691,7 @@ int read_socket_contentlen(connsock_t *cs, int contentlen, float *timeout)
                 LOGERR("Select %s in %s", !ret ? "timed out" : "failed", __func__);
             goto out;
         }
-        ret = recv_available(ckp, cs, MIN(contentlen - nread, PAGESIZE-4));
+        ret = recv_available(ckp, cs, MIN(contentlen - nread, PAGESIZE * 4));
         if (ret < 1) {
             /* If we have done wait_read_select there should be
              * something to read and if we get nothing it means the
@@ -1015,8 +1044,8 @@ static json_t *_json_rpc_call(connsock_t *cs, const char *rpc_req, const bool in
     if (ret != contentlen) {
         tv_time(&fin_tv);
         elapsed = tvdiff(&fin_tv, &stt_tv);
-        ASPRINTF(&warning, "Failed to read content of length %d in %s (%.20s...) %.3fs",
-                 contentlen, __func__, rpc_method(rpc_req), elapsed);
+        ASPRINTF(&warning, "Failed to read content of length %d (got %d) in %s (%.20s...) %.3fs",
+                 contentlen, ret, __func__, rpc_method(rpc_req), elapsed);
         ret = -1;
         goto out_empty;
     }
