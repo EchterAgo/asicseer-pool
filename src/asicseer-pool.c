@@ -784,6 +784,8 @@ int read_socket_line(connsock_t *cs, float *timeout)
         }
         ret = recv_available(ckp, cs, PAGESIZE-4);
         if (ret < 1) {
+            if (errno == EINTR || errno == EAGAIN)
+                continue;
             /* If we have done wait_read_select there should be
              * something to read and if we get nothing it means the
              * socket is closed. */
@@ -923,7 +925,7 @@ static const char *rpc_method(const char *rpc_req)
 
 /* All of these calls are made to bitcoind which prefers open/close instead
  * of persistent connections so cs->fd is always invalid. */
-static json_t *_json_rpc_call(connsock_t *cs, const char *rpc_req, const bool info_only)
+static json_t *_json_rpc_call(connsock_t *cs, const struct rpc_req_part *rpc_req, const bool info_only)
 {
     float timeout = RPC_TIMEOUT;
     char *http_req = NULL;
@@ -933,6 +935,7 @@ static json_t *_json_rpc_call(connsock_t *cs, const char *rpc_req, const bool in
     tv_t stt_tv, fin_tv;
     double elapsed;
     int len, ret;
+    const struct rpc_req_part *cur;
 
     /* Serialise all calls in case we use cs from multiple threads */
     cksem_wait(&cs->sem);
@@ -957,44 +960,62 @@ static json_t *_json_rpc_call(connsock_t *cs, const char *rpc_req, const bool in
         ASPRINTF(&warning, "Null rpc_req passed to %s", __func__);
         goto out;
     }
-    len = strlen(rpc_req);
-    if (unlikely(!len)) {
+    if (unlikely(rpc_req[0].length == 0)) {
         ASPRINTF(&warning, "Zero length rpc_req passed to %s", __func__);
         goto out;
     }
     const int len2 = strlen(cs->auth) + strlen(cs->url) + strlen(cs->port);
-    http_req = ckalloc(len + 256 + len2); // Leave room for headers
+    http_req = ckalloc(256 + len2); // Leave room for headers
+    len = 0;
+    for (cur = rpc_req; cur->string != NULL; cur++) {
+        //assert(strlen(cur->string) == cur->length);
+        len += cur->length;
+    }
     sprintf(http_req,
          "POST / HTTP/1.1\n"
          "Authorization: Basic %s\n"
          "Host: %s:%s\n"
          "Content-type: application/json\n"
-         "Content-Length: %d\n\n%s",
-         cs->auth, cs->url, cs->port, len, rpc_req);
+         "Content-Length: %d\n\n",
+         cs->auth, cs->url, cs->port, len);
 
     len = strlen(http_req);
+
     tv_time(&stt_tv);
     ret = write_socket(cs->fd, http_req, len);
     if (ret != len) {
         tv_time(&fin_tv);
         elapsed = tvdiff(&fin_tv, &stt_tv);
         ASPRINTF(&warning, "Failed to write to socket in %s (%.20s...) %.3fs",
-                 __func__, rpc_method(rpc_req), elapsed);
+                 __func__, rpc_method(rpc_req[0].string), elapsed);
         goto out_empty;
     }
+
+    tv_time(&stt_tv);
+    for (cur = rpc_req; cur->string != NULL; cur++) {
+        ret = write_socket(cs->fd, cur->string, cur->length);
+        if (ret != cur->length) {
+            tv_time(&fin_tv);
+            elapsed = tvdiff(&fin_tv, &stt_tv);
+            ASPRINTF(&warning, "Failed to write to socket in %s (%.20s...) %.3fs",
+                    __func__, rpc_method(rpc_req[0].string), elapsed);
+            goto out_empty;
+        }
+    }
+
     ret = read_socket_line(cs, &timeout);
     if (ret < 1) {
         tv_time(&fin_tv);
         elapsed = tvdiff(&fin_tv, &stt_tv);
         ASPRINTF(&warning, "Failed to read socket line in %s (%.20s...) %.3fs",
-             __func__, rpc_method(rpc_req), elapsed);
+             __func__, rpc_method(rpc_req[0].string), elapsed);
         goto out_empty;
     }
     if (strncasecmp(cs->buf, "HTTP/1.1 200 OK", 15)) {
         tv_time(&fin_tv);
         elapsed = tvdiff(&fin_tv, &stt_tv);
         ASPRINTF(&warning, "HTTP response to (%.20s...) %.3fs not ok: %s",
-             rpc_method(rpc_req), elapsed, cs->buf);
+             rpc_method(rpc_req[0].string), elapsed, cs->buf);
         timeout = 0;
         /* Look for a json response if there is one */
         while (read_socket_line(cs, &timeout) > 0) {
@@ -1004,7 +1025,7 @@ static json_t *_json_rpc_call(connsock_t *cs, const char *rpc_req, const bool in
             free(warning);
             /* Replace the warning with the json response */
             ASPRINTF(&warning, "JSON response to (%.20s...) %.3fs not ok: %s",
-                 rpc_method(rpc_req), elapsed, cs->buf);
+                 rpc_method(rpc_req[0].string), elapsed, cs->buf);
             break;
         }
         goto out_empty;
@@ -1016,7 +1037,7 @@ static json_t *_json_rpc_call(connsock_t *cs, const char *rpc_req, const bool in
             tv_time(&fin_tv);
             elapsed = tvdiff(&fin_tv, &stt_tv);
             ASPRINTF(&warning, "Failed to read http socket lines in %s (%.20s...) %.3fs",
-                 __func__, rpc_method(rpc_req), elapsed);
+                 __func__, rpc_method(rpc_req[0].string), elapsed);
             goto out_empty;
         }
         if (0 == strncasecmp("Content-Length: ", cs->buf, 16)) {
@@ -1024,7 +1045,7 @@ static json_t *_json_rpc_call(connsock_t *cs, const char *rpc_req, const bool in
             if (1 != sscanf(cs->buf + 16, "%d", &contentlen) || contentlen < 0) {
                 // parse error
                 ASPRINTF(&warning, "Failed to read content-length lines in %s (%.20s...) %.3fs",
-                         __func__, rpc_method(rpc_req), elapsed);
+                         __func__, rpc_method(rpc_req[0].string), elapsed);
                 goto out_empty;
             }
             // read blank line
@@ -1032,7 +1053,7 @@ static json_t *_json_rpc_call(connsock_t *cs, const char *rpc_req, const bool in
                 tv_time(&fin_tv);
                 elapsed = tvdiff(&fin_tv, &stt_tv);
                 ASPRINTF(&warning, "Failed to read a blank line after content-length: %d in %s (%.20s...) %.3fs, got ret: %d",
-                         contentlen, __func__, rpc_method(rpc_req), elapsed, ret);
+                         contentlen, __func__, rpc_method(rpc_req[0].string), elapsed, ret);
                 ret = -1;
                 goto out_empty;
             }
@@ -1045,7 +1066,7 @@ static json_t *_json_rpc_call(connsock_t *cs, const char *rpc_req, const bool in
         tv_time(&fin_tv);
         elapsed = tvdiff(&fin_tv, &stt_tv);
         ASPRINTF(&warning, "Failed to read content of length %d (got %d) in %s (%.20s...) %.3fs",
-                 contentlen, ret, __func__, rpc_method(rpc_req), elapsed);
+                 contentlen, ret, __func__, rpc_method(rpc_req[0].string), elapsed);
         ret = -1;
         goto out_empty;
     }
@@ -1053,7 +1074,7 @@ static json_t *_json_rpc_call(connsock_t *cs, const char *rpc_req, const bool in
     elapsed = tvdiff(&fin_tv, &stt_tv);
     if (elapsed > 5.0) {
         ASPRINTF(&warning, "HTTP socket read+write took %.3fs in %s (%.20s...)",
-                 elapsed, __func__, rpc_method(rpc_req));
+                 elapsed, __func__, rpc_method(rpc_req[0].string));
     }
     {
         // parse json, if it takes longer than 0.1 seconds to parse, print to debug log
@@ -1062,11 +1083,11 @@ static json_t *_json_rpc_call(connsock_t *cs, const char *rpc_req, const bool in
         const double elapsed = (time_micros() - t0) / 1e6;
         if (elapsed >= 0.1)
             LOGDEBUG("%s: json_loads (%.20s...) took %1.6f secs", __func__,
-                     rpc_method(rpc_req), elapsed);
+                     rpc_method(rpc_req[0].string), elapsed);
     }
     if (!val) {
         ASPRINTF(&warning, "JSON decode (%.20s...) failed(%d): %s",
-                 rpc_method(rpc_req), err_val.line, err_val.text);
+                 rpc_method(rpc_req[0].string), err_val.line, err_val.text);
     }
 out_empty:
     empty_socket(cs->fd);
@@ -1086,21 +1107,38 @@ out:
     return val;
 }
 
-json_t *json_rpc_call(connsock_t *cs, const char *rpc_req)
+json_t *json_rpc_call_parts(connsock_t *cs, const struct rpc_req_part *rpc_req)
 {
     return _json_rpc_call(cs, rpc_req, false);
 }
 
+json_t *json_rpc_call(connsock_t *cs, const char *rpc_req)
+{
+    struct rpc_req_part parts[] = {
+        { rpc_req, strlen(rpc_req) },
+        { NULL, 0 }
+    };
+    return _json_rpc_call(cs, parts, false);
+}
+
 json_t *json_rpc_response(connsock_t *cs, const char *rpc_req)
 {
-    return _json_rpc_call(cs, rpc_req, true);
+    struct rpc_req_part parts[] = {
+        { rpc_req, strlen(rpc_req) },
+        { NULL, 0 }
+    };
+    return _json_rpc_call(cs, parts, true);
 }
 
 /* For when we are submitting information that is not important and don't care
  * about the response. */
 void json_rpc_msg(connsock_t *cs, const char *rpc_req)
 {
-    json_t *val = _json_rpc_call(cs, rpc_req, true);
+    struct rpc_req_part parts[] = {
+        { rpc_req, strlen(rpc_req) },
+        { NULL, 0 }
+    };
+    json_t *val = _json_rpc_call(cs, parts, true);
 
     /* We don't care about the result */
     json_decref(val);
